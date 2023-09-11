@@ -72,6 +72,11 @@ func AppWork() error {
 
 	xError=app.RunApp(gConfig)
 
+	if xError!=nil{
+		cheerlib.StdError(fmt.Sprintf("app.RunApp with error:%s",xError.Error()))
+	}
+
+
 	return xError
 
 }

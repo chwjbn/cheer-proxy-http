@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/chwjbn/cheer-socks/app/appservice"
 	"github.com/chwjbn/cheer-socks/cheerlib"
 	"github.com/chwjbn/cheer-socks/config"
 	"github.com/chwjbn/trojanx"
@@ -13,6 +14,7 @@ import (
 	"github.com/chwjbn/xclash/adapter/outbound"
 	"github.com/chwjbn/xclash/constant"
 	"github.com/chwjbn/xclash/transport/socks5"
+	"github.com/gin-gonic/gin"
 	"io"
 	"net"
 	"path"
@@ -21,6 +23,7 @@ import (
 
 type ProxyApp struct {
 	mConfig *config.ConfigApp
+	mDataSvc *appservice.DataService
 }
 
 func RunApp(cfg *config.ConfigApp) error  {
@@ -29,19 +32,74 @@ func RunApp(cfg *config.ConfigApp) error  {
 	proxyApp:=new(ProxyApp)
 	proxyApp.mConfig=cfg
 
+	proxyApp.mDataSvc,xError=appservice.NewDataService(appservice.DataCacheConfig{
+		CacheRedisAddr: cfg.CacheRedisAddr,
+		CacheRedisUser: cfg.CacheRedisUser,
+		CacheRedisPwd: cfg.CacheRedisPwd,
+		CacheRedisDb: cfg.CacheRedisDb,
+	})
+
+	if xError!=nil{
+		return xError
+	}
 
 	xError=proxyApp.runService()
 
     return xError
 }
 
+func (this *ProxyApp)onWebApiIndex(ctx *gin.Context)  {
+	ctx.Redirect(301,"https://www.baidu.com")
+}
+
+func (this *ProxyApp)onWebApiOpenAccountSub(ctx *gin.Context)  {
+
+	xAccToken,_:=ctx.GetQuery("token")
+	if len(xAccToken)<1{
+		ctx.String(200,"invalid request")
+		return
+	}
+
+	xAccData,xErr:=this.mDataSvc.GetProxyAccount(xAccToken)
+	if xErr!=nil{
+		ctx.String(200,"invalid request")
+		return
+	}
+
+	ctx.String(200,xAccData.SubUrlData)
+}
+
 func (this *ProxyApp) runService() error {
 
 	var xError error
 
+	xError=this.runWebApiService()
+	if xError!=nil{
+		return xError
+	}
+
 	xError=this.runTrojanService()
 
 	return xError
+}
+
+func (this *ProxyApp)runWebApiService() error  {
+
+	var xError error
+
+	gin.SetMode(gin.DebugMode)
+	xRouter := gin.Default()
+	xRouter.SetTrustedProxies([]string{"127.0.0.1"})
+	xRouter.GET("/open/account/sub",this.onWebApiOpenAccountSub)
+	xRouter.GET("/",this.onWebApiIndex)
+
+	xServerHostPort:=fmt.Sprintf("%s:%d",this.mConfig.HttpServerAddr,this.mConfig.HttpServerPort)
+	go func() {
+		xRouter.Run(xServerHostPort)
+	}()
+
+	return xError
+
 }
 
 func (this *ProxyApp) runTrojanService() error  {
@@ -72,8 +130,8 @@ func (this *ProxyApp) runTrojanService() error  {
 		},
 		ReverseProxyConfig: &trojanx.ReverseProxyConfig{
 			Scheme: "http",
-			Host:   "www.baidu.com",
-			Port:   80,
+			Host:   "127.0.0.1",
+			Port:   this.mConfig.HttpServerPort,
 		},
 	}
 
@@ -84,6 +142,20 @@ func (this *ProxyApp) runTrojanService() error  {
 	}
 
 	xServer.AuthenticationHandler = func(ctx context.Context, hash string) bool {
+
+		if len(hash)<1{
+			return false
+		}
+
+		xAccData,xErr:=this.mDataSvc.GetProxyInbound(hash)
+		if xErr!=nil{
+			return false
+		}
+
+		if len(xAccData.InboundId)<1{
+			return false
+		}
+
 		return true
 	}
 
@@ -135,7 +207,6 @@ func (this *ProxyApp) runTrojanService() error  {
 
 		this.processSocks5Conn(&xDesMeta,xSrcMeta.SrcConn,hash)
 
-
 		return xError
 
 	}
@@ -148,25 +219,29 @@ func (this *ProxyApp) runTrojanService() error  {
 
 func (this *ProxyApp)processSocks5Conn(srcMeta *constant.Metadata,srcConn net.Conn,userHash string)  {
 
+	xLogInfo:=""
 
-	xLogInfo:=fmt.Sprintf("++++++++begin srcConnCtx from=[%s] to=[%s]",srcMeta.SourceAddress(),srcMeta.RemoteAddress())
+	xNode:=this.mDataSvc.GetProxyNodeByInboundPwd(userHash)
+
+	if len(xNode.NodeId)<1{
+		xLogInfo=fmt.Sprintf("!!!!!!!!!!no route for srcConnCtx userHash=[%s] from=[%s] to=[%s]",userHash,srcMeta.SourceAddress(),srcMeta.RemoteAddress())
+		cheerlib.LogError(xLogInfo)
+		cheerlib.StdError(xLogInfo)
+		return
+	}
+
+	xLogInfo=fmt.Sprintf("@@@@@@@@@@route srcConnCtx userHash=[%s] from=[%s] to=[%s] to node=[%s]",userHash,srcMeta.SourceAddress(),srcMeta.RemoteAddress(),xNode.NodeId)
 	cheerlib.LogInfo(xLogInfo)
 	cheerlib.StdInfo(xLogInfo)
-
 
 	xNextProxyOpt:=outbound.Socks5Option{}
 	xNextProxyOpt.UDP=false
 	xNextProxyOpt.SkipCertVerify=true
 
-	xNextProxyOpt.Server="dreambali.abc123.vip"
-	xNextProxyOpt.Port=65534
-	xNextProxyOpt.UserName="64e6ece473a8056df8de728f"
-	xNextProxyOpt.Password=""
-
-	//xNextProxyOpt.Server="127.0.0.1"
-	//xNextProxyOpt.Port=10808
-	//xNextProxyOpt.UserName=""
-	//xNextProxyOpt.Password=""
+	xNextProxyOpt.Server=xNode.ServerAddr
+	xNextProxyOpt.Port=xNode.ServerPort
+	xNextProxyOpt.UserName=xNode.Username
+	xNextProxyOpt.Password=xNode.Password
 
 	xNextProxy:=outbound.NewSocks5(xNextProxyOpt)
 
@@ -178,11 +253,6 @@ func (this *ProxyApp)processSocks5Conn(srcMeta *constant.Metadata,srcConn net.Co
 	}
 
 	this.processConnRelay(xNextConn,srcConn)
-
-	xLogInfo=fmt.Sprintf("--------end srcConnCtx from=[%s] to=[%s]",srcMeta.SourceAddress(),srcMeta.RemoteAddress())
-	cheerlib.LogInfo(xLogInfo)
-	cheerlib.StdInfo(xLogInfo)
-
 }
 
 func (this *ProxyApp)processConnRelay(localConn net.Conn,remoteConn net.Conn)  {
