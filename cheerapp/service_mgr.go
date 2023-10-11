@@ -2,7 +2,7 @@ package cheerapp
 
 import (
 	"fmt"
-	"github.com/chwjbn/cheer-socks/cheerlib"
+	"github.com/chwjbn/cheer-proxy-http/cheerlib"
 	"github.com/kardianos/service"
 	"os"
 	"os/signal"

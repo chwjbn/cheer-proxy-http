@@ -3,8 +3,8 @@ package appservice
 import (
 	"errors"
 	"fmt"
-	"github.com/chwjbn/cheer-socks/app/appmodel"
-	"github.com/chwjbn/cheer-socks/cheerlib"
+	"github.com/chwjbn/cheer-proxy-http/app/appmodel"
+	"github.com/chwjbn/cheer-proxy-http/cheerlib"
 	"github.com/gomodule/redigo/redis"
 	"strings"
 	"time"

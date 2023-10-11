@@ -1,3 +1,3 @@
-chmod +x ./out/cheer_socks_linux
-docker build -t hub.aiagain.com/vernus/cheersocks:prod .
-docker push hub.aiagain.com/vernus/cheersocks:prod
+chmod +x ./out/cheer_proxy_http_linux
+docker build -t hub.aiagain.com/vernus/cheer-proxy-http:prod .
+docker push hub.aiagain.com/vernus/cheer-proxy-http:prod
