@@ -31,7 +31,7 @@ func (this *ConfigApp) Check() error {
 	}
 
 	if len(this.AppName)<1{
-		this.AppGroup="cheer-socks"
+		this.AppGroup="cheer-proxy-http"
 	}
 
 	if len(this.ServerAddr)<1{

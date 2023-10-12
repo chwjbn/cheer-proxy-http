@@ -1,23 +1,16 @@
 package app
 
 import (
-	"context"
-	"crypto/tls"
-	"errors"
 	"fmt"
-	"github.com/chwjbn/cheer-socks/app/appservice"
-	"github.com/chwjbn/cheer-socks/cheerlib"
-	"github.com/chwjbn/cheer-socks/config"
-	"github.com/chwjbn/trojanx"
-	"github.com/chwjbn/trojanx/metadata"
-	"github.com/chwjbn/trojanx/protocol"
-	"github.com/chwjbn/xclash/adapter/outbound"
-	"github.com/chwjbn/xclash/constant"
-	"github.com/chwjbn/xclash/transport/socks5"
+	"github.com/chwjbn/cheer-proxy-http/app/appservice"
+	"github.com/chwjbn/cheer-proxy-http/cheerlib"
+	"github.com/chwjbn/cheer-proxy-http/config"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/net/proxy"
 	"io"
 	"net"
-	"path"
+	"net/http"
+	"strings"
 	"sync"
 )
 
@@ -48,214 +41,183 @@ func RunApp(cfg *config.ConfigApp) error  {
     return xError
 }
 
-func (this *ProxyApp)onWebApiIndex(ctx *gin.Context)  {
-	ctx.Redirect(301,"https://www.baidu.com")
+
+func (this *ProxyApp)onSubRequest(ctx *gin.Context)  {
+
+	xToken:=ctx.DefaultQuery("token","")
+
+    xUrl:=fmt.Sprintf("https://vernus.abc123.vip/xapi/api/proxy/sub-http?token=%s",xToken)
+
+    xHttpClient:=http.Client{}
+
+    xResp,xRespErr:=xHttpClient.Get(xUrl)
+
+    if xRespErr!=nil{
+    	ctx.String(http.StatusGone,"system busy.")
+		return
+	}
+
+	io.Copy(ctx.Writer,xResp.Body)
 }
 
-func (this *ProxyApp)onWebApiOpenAccountSub(ctx *gin.Context)  {
 
-	xAccToken,_:=ctx.GetQuery("token")
-	if len(xAccToken)<1{
-		ctx.String(200,"invalid request")
+func (this *ProxyApp)onProxyRequest(ctx *gin.Context)  {
+
+	xRequest:=ctx.Request
+
+	xAuthVal:=xRequest.Header.Get("Proxy-Authorization")
+	if len(xAuthVal)<1{
+		ctx.String(http.StatusProxyAuthRequired,"please provide correct auth info(251).")
 		return
 	}
 
-	xAccData,xErr:=this.mDataSvc.GetProxyAccount(xAccToken)
-	if xErr!=nil{
-		ctx.String(200,"invalid request")
+	xAuthUser:=cheerlib.WebHttpBasicAuthDecode(xAuthVal)
+	if xAuthUser==nil{
+		ctx.String(http.StatusProxyAuthRequired,"please provide correct auth info(252).")
 		return
 	}
 
-	ctx.String(200,xAccData.SubUrlData)
+	cheerlib.StdInfo(fmt.Sprintf("Auth(Username=[%s],Password=[%s])",xAuthUser.Username,xAuthUser.Password))
+
+	xProxyAcc,xProxyAccErr:=this.mDataSvc.GetProxyAccount(xAuthUser.Username)
+	if xProxyAccErr!=nil||len(xProxyAcc.AccountId)<1{
+		ctx.String(http.StatusProxyAuthRequired,"please provide correct auth info(253).")
+		return
+	}
+
+
+	xProxyNode,xProxyNodeErr:=this.mDataSvc.GetProxyNode(xAuthUser.Password)
+	if xProxyNodeErr!=nil||len(xProxyNode.NodeId)<1{
+		ctx.String(http.StatusProxyAuthRequired,"please provide correct auth info(254).")
+		return
+	}
+
+	xProxyDailer,xProxyDailerErr:=proxy.SOCKS5("tcp",
+		fmt.Sprintf("%s:%d",xProxyNode.ServerAddr,xProxyNode.ServerPort),
+		&proxy.Auth{User: xProxyNode.Username,Password: xProxyNode.Password},
+		proxy.Direct,
+	)
+
+	if xProxyDailerErr!=nil{
+		ctx.String(http.StatusServiceUnavailable,"backend node busy.")
+		return
+	}
+
+
+	xIsKeepAlive:=false
+	if strings.EqualFold(strings.ToLower(xRequest.Header.Get("Proxy-Connection")),"keep-alive"){
+		xIsKeepAlive=true
+	}
+
+	xDestHost := xRequest.Header.Get("Host")
+	if len(xDestHost)<1{
+		xDestHost=xRequest.URL.Host
+	}
+
+	if len(xDestHost)>0{
+		xRequest.Host=xDestHost
+	}
+
+
+	xRequest.RequestURI = ""
+
+	removeHopByHopHeaders(xRequest.Header)
+	removeExtraHTTPHostPort(xRequest)
+
+    if len(xRequest.Host)<1||len(xRequest.URL.Host)<1{
+		ctx.String(http.StatusBadRequest,"invalid request.")
+		return
+	}
+
+	xSrcConn,_,xSrcConnErr:=ctx.Writer.Hijack()
+	if xSrcConnErr!=nil{
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	xLogData:=fmt.Sprintf("Begin HttpMethod=[%s] To xDestHost=[%s]",xRequest.Method,xDestHost)
+	cheerlib.StdInfo(xLogData)
+	cheerlib.LogInfo(xLogData)
+
+	//HTTPS隧道连接
+	if strings.EqualFold(xRequest.Method,http.MethodConnect){
+
+		xTargetConn,xTargetConnErr:=xProxyDailer.Dial("tcp",xDestHost)
+
+		if xTargetConnErr!=nil{
+			xRespData:=fmt.Sprintf("HTTP/%d.%d %03d %s\n\n",xRequest.ProtoMajor, xRequest.ProtoMinor, http.StatusBadGateway, "Bad gateway")
+			fmt.Fprint(xSrcConn,xRespData)
+			xSrcConn.Close()
+			return
+		}
+
+		xRespData:=fmt.Sprintf("HTTP/%d.%d %03d %s\n\n",xRequest.ProtoMajor, xRequest.ProtoMinor, http.StatusOK, "Connection established")
+		fmt.Fprint(xSrcConn,xRespData)
+
+		processConnRelay(xSrcConn,xTargetConn)
+
+		return
+	}
+
+
+	//HTTP连接
+	xTransport:=http.Transport{}
+	xTransport.Dial=xProxyDailer.Dial
+
+	xHttpClient:=http.Client{Transport: &xTransport}
+	xResp,xRespErr:=xHttpClient.Do(xRequest)
+	if xRespErr!=nil{
+		ctx.String(http.StatusBadGateway,"backend node is busy now.")
+		return
+	}
+
+
+	if xIsKeepAlive {
+		xResp.Header.Set("Proxy-Connection", "keep-alive")
+		xResp.Header.Set("Connection", "keep-alive")
+		xResp.Header.Set("Keep-Alive", "timeout=4")
+	}
+
+	xResp.Close = !xIsKeepAlive
+	xResp.Write(xSrcConn)
+	xSrcConn.Close()
 }
 
 func (this *ProxyApp) runService() error {
 
 	var xError error
 
-	xError=this.runWebApiService()
-	if xError!=nil{
-		return xError
-	}
-
-	xError=this.runTrojanService()
+	xError=this.runWebProxyService()
 
 	return xError
 }
 
-func (this *ProxyApp)runWebApiService() error  {
+
+
+func (this *ProxyApp)runWebProxyService() error  {
 
 	var xError error
+
+	xServerHostPort:=fmt.Sprintf("%s:%d",this.mConfig.ServerAddr,this.mConfig.ServerPort)
 
 	gin.SetMode(gin.DebugMode)
 	xRouter := gin.Default()
 	xRouter.SetTrustedProxies([]string{"127.0.0.1"})
-	xRouter.GET("/open/account/sub",this.onWebApiOpenAccountSub)
-	xRouter.GET("/",this.onWebApiIndex)
 
-	xServerHostPort:=fmt.Sprintf("%s:%d",this.mConfig.HttpServerAddr,this.mConfig.HttpServerPort)
+	xRouter.GET("/proxy/sub",this.onSubRequest)
+	xRouter.NoRoute(this.onProxyRequest)
+	xRouter.NoMethod(this.onProxyRequest)
+
 	go func() {
 		xRouter.Run(xServerHostPort)
 	}()
 
-	return xError
-
-}
-
-func (this *ProxyApp) runTrojanService() error  {
-
-	var xError error
-
-	xCertFilePath := path.Join(cheerlib.ApplicationBaseDirectory(),"config", "cert.pem")
-	if !cheerlib.FileExists(xCertFilePath) {
-		xError = errors.New("Lost cert File:" + xCertFilePath)
-		return xError
-	}
-
-	xKeyFilePath := path.Join(cheerlib.ApplicationBaseDirectory(),"config", "key.pem")
-	if !cheerlib.FileExists(xCertFilePath) {
-		xError = errors.New("Lost key File:" + xKeyFilePath)
-		return xError
-	}
-
-	xServerCnf:=trojanx.Config{
-		Host: this.mConfig.ServerAddr,
-		Port: this.mConfig.ServerPort,
-		TLSConfig: &trojanx.TLSConfig{
-			MinVersion: tls.VersionTLS13,
-			MaxVersion: tls.VersionTLS13,
-			CertificateFiles: []trojanx.CertificateFileConfig{
-				{PublicKeyFile: xCertFilePath, PrivateKeyFile: xKeyFilePath},
-			},
-		},
-		ReverseProxyConfig: &trojanx.ReverseProxyConfig{
-			Scheme: "http",
-			Host:   "127.0.0.1",
-			Port:   this.mConfig.HttpServerPort,
-		},
-	}
-
-	xServer:=trojanx.New(context.Background(),&xServerCnf)
-
-	xServer.ConnectHandler = func(ctx context.Context) bool {
-		return true
-	}
-
-	xServer.AuthenticationHandler = func(ctx context.Context, hash string) bool {
-
-		if len(hash)<1{
-			return false
-		}
-
-		xAccData,xErr:=this.mDataSvc.GetProxyInbound(hash)
-		if xErr!=nil{
-			return false
-		}
-
-		if len(xAccData.InboundId)<1{
-			return false
-		}
-
-		return true
-	}
-
-	xServer.ErrorHandler = func(ctx context.Context, err error) {
-		cheerlib.LogError(fmt.Sprintf("Trojan Server With Error:%s",err.Error()))
-	}
-	
-	xServer.ForwardHandler= func(ctx context.Context, hash string, request protocol.Request) error {
-
-		var xError error
-
-		xSrcMeta:=metadata.FromContext(ctx)
-
-		xSrcAddrHost,xSrcAddrPort,xSrcAddrErr:=net.SplitHostPort(xSrcMeta.RemoteAddr.String())
-
-		if xSrcAddrErr!=nil{
-			xError=errors.New("error src address")
-			return xError
-		}
-
-
-		xDesMeta:=constant.Metadata{
-			NetWork: constant.TCP,
-			Type: constant.SOCKS5,
-			SrcIP: net.ParseIP(xSrcAddrHost),
-			SrcPort: xSrcAddrPort,
-			DstPort: fmt.Sprintf("%d",request.DescriptionPort),
-
-		}
-
-
-		if request.AddressType==protocol.AddressTypeIPv4{
-			xDesMeta.AddrType=socks5.AtypIPv4
-			xDesMeta.DstIP=net.ParseIP(request.DescriptionAddress)
-			xDesMeta.DNSMode=constant.DNSNormal
-		}
-
-		if request.AddressType==protocol.AddressTypeDomain{
-			xDesMeta.AddrType=socks5.AtypDomainName
-			xDesMeta.Host=request.DescriptionAddress
-			xDesMeta.DNSMode=constant.DNSMapping
-		}
-
-		if request.AddressType==protocol.AddressTypeIPv6{
-			xDesMeta.AddrType=socks5.AtypIPv6
-			xDesMeta.DstIP=net.ParseIP(request.DescriptionAddress)
-			xDesMeta.DNSMode=constant.DNSNormal
-		}
-
-		this.processSocks5Conn(&xDesMeta,xSrcMeta.SrcConn,hash)
-
-		return xError
-
-	}
-
-	xServerErr:=xServer.Run()
-	xError=errors.New(fmt.Sprintf("Trojan Server Run With Error:%s",xServerErr.Error()))
 
 	return xError
+
 }
 
-func (this *ProxyApp)processSocks5Conn(srcMeta *constant.Metadata,srcConn net.Conn,userHash string)  {
-
-	xLogInfo:=""
-
-	xNode:=this.mDataSvc.GetProxyNodeByInboundPwd(userHash)
-
-	if len(xNode.NodeId)<1{
-		xLogInfo=fmt.Sprintf("!!!!!!!!!!no route for srcConnCtx userHash=[%s] from=[%s] to=[%s]",userHash,srcMeta.SourceAddress(),srcMeta.RemoteAddress())
-		cheerlib.LogError(xLogInfo)
-		cheerlib.StdError(xLogInfo)
-		return
-	}
-
-	xLogInfo=fmt.Sprintf("@@@@@@@@@@route srcConnCtx userHash=[%s] from=[%s] to=[%s] to node=[%s]",userHash,srcMeta.SourceAddress(),srcMeta.RemoteAddress(),xNode.NodeId)
-	cheerlib.LogInfo(xLogInfo)
-	cheerlib.StdInfo(xLogInfo)
-
-	xNextProxyOpt:=outbound.Socks5Option{}
-	xNextProxyOpt.UDP=false
-	xNextProxyOpt.SkipCertVerify=true
-
-	xNextProxyOpt.Server=xNode.ServerAddr
-	xNextProxyOpt.Port=xNode.ServerPort
-	xNextProxyOpt.UserName=xNode.Username
-	xNextProxyOpt.Password=xNode.Password
-
-	xNextProxy:=outbound.NewSocks5(xNextProxyOpt)
-
-	xNextConn,xNextConnErr:=xNextProxy.DialContext(context.Background(),srcMeta)
-
-	if xNextConnErr!=nil{
-		cheerlib.LogError(fmt.Sprintf("NextProxy.DialContext Error:%s",xNextConnErr.Error()))
-		return
-	}
-
-	this.processConnRelay(xNextConn,srcConn)
-}
-
-func (this *ProxyApp)processConnRelay(localConn net.Conn,remoteConn net.Conn)  {
+func processConnRelay(localConn net.Conn,remoteConn net.Conn)  {
 
 	var xWaitGroup sync.WaitGroup
 	xWaitGroup.Add(2)
@@ -276,3 +238,42 @@ func (this *ProxyApp)processConnRelay(localConn net.Conn,remoteConn net.Conn)  {
 	remoteConn.Close()
 }
 
+// removeHopByHopHeaders remove hop-by-hop header
+func removeHopByHopHeaders(header http.Header) {
+	// Strip hop-by-hop header based on RFC:
+	// http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.5.1
+	// https://www.mnot.net/blog/2011/07/11/what_proxies_must_do
+
+	header.Del("Proxy-Connection")
+	header.Del("Proxy-Authenticate")
+	header.Del("Proxy-Authorization")
+	header.Del("TE")
+	header.Del("Trailers")
+	header.Del("Transfer-Encoding")
+	header.Del("Upgrade")
+
+	connections := header.Get("Connection")
+	header.Del("Connection")
+	if len(connections) == 0 {
+		return
+	}
+	for _, h := range strings.Split(connections, ",") {
+		header.Del(strings.TrimSpace(h))
+	}
+}
+
+// removeExtraHTTPHostPort remove extra host port (example.com:80 --> example.com)
+// It resolves the behavior of some HTTP servers that do not handle host:80 (e.g. baidu.com)
+func removeExtraHTTPHostPort(req *http.Request) {
+	host := req.Host
+	if host == "" {
+		host = req.URL.Host
+	}
+
+	if pHost, port, err := net.SplitHostPort(host); err == nil && port == "80" {
+		host = pHost
+	}
+
+	req.Host = host
+	req.URL.Host = host
+}

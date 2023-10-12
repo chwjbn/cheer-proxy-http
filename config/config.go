@@ -2,7 +2,7 @@ package config
 
 import (
 	"fmt"
-	"github.com/chwjbn/cheer-socks/cheerlib"
+	"github.com/chwjbn/cheer-proxy-http/cheerlib"
 	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"os"

@@ -10,6 +10,50 @@ import (
 	"strings"
 )
 
+type AuthUser struct {
+	Username string
+	Password string
+}
+
+func WebHttpBasicAuthDecode(basicAuth string) *AuthUser  {
+
+	var authUser *AuthUser
+
+	if !strings.HasPrefix(basicAuth,"Basic"){
+		return authUser
+	}
+
+	xAuthStr:=strings.TrimPrefix(basicAuth,"Basic")
+	xAuthStr=strings.TrimSpace(xAuthStr)
+
+	if len(xAuthStr)<1{
+		return authUser
+	}
+
+	xAuthStr=EncryptBase64Decode(xAuthStr)
+	if len(xAuthStr)<1{
+		return authUser
+	}
+
+	xAuthArr:=strings.Split(xAuthStr,":")
+	if len(xAuthArr)<1{
+		return authUser
+	}
+
+	if len(xAuthArr)!=2{
+		return authUser
+	}
+
+	authUser=&AuthUser{}
+
+	authUser.Username=xAuthArr[0]
+	authUser.Password=xAuthArr[1]
+
+	return authUser
+
+}
+
+
 func WebGetContentType(urlPath string) string {
 
 	sData := "text/html; charset=utf-8"

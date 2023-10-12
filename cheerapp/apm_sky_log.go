@@ -3,7 +3,7 @@ package cheerapp
 import (
 	"context"
 	"fmt"
-	"github.com/chwjbn/cheer-socks/cheerlib"
+	"github.com/chwjbn/cheer-proxy-http/cheerlib"
 	"strings"
 )
 
