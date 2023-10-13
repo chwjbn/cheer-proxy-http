@@ -230,6 +230,9 @@ func (this *ProxyApp)processProxyPlainHttpRequest(ctx *gin.Context)  {
 	xHttpClient:=http.Client{Transport: &xTransport}
 	xResp,xRespErr:=xHttpClient.Do(xRequest)
 	if xRespErr!=nil{
+
+		cheerlib.StdInfo(fmt.Sprintf("processProxyPlainHttpRequest Request From=[%s] With HttpResp Error:%s",ctx.Request.RemoteAddr,xRespErr.Error()))
+
 		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
