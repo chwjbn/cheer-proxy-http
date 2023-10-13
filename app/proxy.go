@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"github.com/chwjbn/cheer-proxy-http/app/appservice"
 	"github.com/chwjbn/cheer-proxy-http/cheerlib"
@@ -10,9 +11,16 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 )
+
+type ProxyNextContext struct {
+	NextDailer proxy.Dialer
+	KeepAlive bool
+	TargetHostPort string
+}
 
 type ProxyApp struct {
 	mConfig *config.ConfigApp
@@ -60,36 +68,36 @@ func (this *ProxyApp)onSubRequest(ctx *gin.Context)  {
 	io.Copy(ctx.Writer,xResp.Body)
 }
 
+func (this *ProxyApp)getProxyNextContext(ctx *gin.Context) (*ProxyNextContext,error)  {
 
-func (this *ProxyApp)onProxyRequest(ctx *gin.Context)  {
+	var xError error
 
 	xRequest:=ctx.Request
 
 	xAuthVal:=xRequest.Header.Get("Proxy-Authorization")
 	if len(xAuthVal)<1{
-		ctx.String(http.StatusProxyAuthRequired,"please provide correct auth info(251).")
-		return
+		xError=errors.New(fmt.Sprintf("Request From=[%s] Lost Header=[Proxy-Authorization]",xRequest.RemoteAddr))
+		return nil,xError
 	}
 
 	xAuthUser:=cheerlib.WebHttpBasicAuthDecode(xAuthVal)
 	if xAuthUser==nil{
-		ctx.String(http.StatusProxyAuthRequired,"please provide correct auth info(252).")
-		return
+		xError=errors.New(fmt.Sprintf("Request From=[%s] With Invalid Proxy HttpBasicAuth",xRequest.RemoteAddr))
+		return nil,xError
 	}
 
-	cheerlib.StdInfo(fmt.Sprintf("Auth(Username=[%s],Password=[%s])",xAuthUser.Username,xAuthUser.Password))
+	cheerlib.StdInfo(fmt.Sprintf("Request From=[%s] With Auth(username=[%s],password=[%s])",xRequest.RemoteAddr,xAuthUser.Username,xAuthUser.Password))
 
 	xProxyAcc,xProxyAccErr:=this.mDataSvc.GetProxyAccount(xAuthUser.Username)
 	if xProxyAccErr!=nil||len(xProxyAcc.AccountId)<1{
-		ctx.String(http.StatusProxyAuthRequired,"please provide correct auth info(253).")
-		return
+		xError=errors.New(fmt.Sprintf("Request From=[%s] With Invalid Proxy Username",xRequest.RemoteAddr))
+		return nil,xError
 	}
-
 
 	xProxyNode,xProxyNodeErr:=this.mDataSvc.GetProxyNode(xAuthUser.Password)
 	if xProxyNodeErr!=nil||len(xProxyNode.NodeId)<1{
-		ctx.String(http.StatusProxyAuthRequired,"please provide correct auth info(254).")
-		return
+		xError=errors.New(fmt.Sprintf("Request From=[%s] With Invalid Proxy Password",xRequest.RemoteAddr))
+		return nil,xError
 	}
 
 	xProxyDailer,xProxyDailerErr:=proxy.SOCKS5("tcp",
@@ -99,77 +107,165 @@ func (this *ProxyApp)onProxyRequest(ctx *gin.Context)  {
 	)
 
 	if xProxyDailerErr!=nil{
-		ctx.String(http.StatusServiceUnavailable,"backend node busy.")
+		xError=errors.New(fmt.Sprintf("Request From=[%s] With ProxyDailerError:%s",xRequest.RemoteAddr,xProxyDailerErr.Error()))
+		return nil,xError
+	}
+
+	xProxyNextContext:=ProxyNextContext{}
+	xProxyNextContext.NextDailer=xProxyDailer
+
+	xProxyNextContext.KeepAlive=false
+	if strings.EqualFold(strings.ToLower(xRequest.Header.Get("Proxy-Connection")),"keep-alive"){
+		xProxyNextContext.KeepAlive=true
+	}
+
+	xDestHostPort := xRequest.Header.Get("Host")
+	if len(xDestHostPort)<1{
+		xDestHostPort=xRequest.URL.Host
+	}
+
+	var xDefaultPort uint64=80
+	if strings.EqualFold(xRequest.URL.Scheme, "https") {
+		xDefaultPort=443
+	}
+
+	xDestHostPort,xParseErr:=ParseHostPort(xDestHostPort,xDefaultPort)
+	if xParseErr!=nil{
+		xError=errors.New(fmt.Sprintf("Request From=[%s] With HostPort ParseError:%s",xRequest.RemoteAddr,xParseErr.Error()))
+		return nil,xError
+	}
+
+	xProxyNextContext.TargetHostPort=xDestHostPort
+
+	return &xProxyNextContext,nil
+}
+
+
+//处理HTTPS
+func (this *ProxyApp)processProxyConnectHttpRequest(ctx *gin.Context)  {
+
+	xProxyDailer,xProxyDailerErr:=this.getProxyNextContext(ctx)
+	if xProxyDailerErr!=nil{
+		cheerlib.LogWarn(xProxyDailerErr.Error())
+		cheerlib.StdInfo(xProxyDailerErr.Error())
+		ctx.AbortWithStatus(http.StatusProxyAuthRequired)
+		return
+	}
+
+	xRequest:=ctx.Request
+
+	cheerlib.StdInfo(fmt.Sprintf("processProxyConnectHttpRequest Request From=[%s] getProxyNextContext KeepAlive=[%v] Target=[%s]",
+		ctx.Request.RemoteAddr,
+		xProxyDailer.KeepAlive,
+		xProxyDailer.TargetHostPort))
+
+	xTargetConn,xTargetConnErr:=xProxyDailer.NextDailer.Dial("tcp",xProxyDailer.TargetHostPort)
+	if xTargetConnErr!=nil{
+
+		cheerlib.StdInfo(fmt.Sprintf("processProxyConnectHttpRequest Request From=[%s] With NextDailer Error:%s",ctx.Request.RemoteAddr,xTargetConnErr.Error()))
+		ctx.AbortWithStatus(http.StatusBadGateway)
+		return
+	}
+
+	xSrcConn,_,xSrcConnErr:=ctx.Writer.Hijack()
+	if xSrcConnErr!=nil{
+
+		cheerlib.StdInfo(fmt.Sprintf("processProxyConnectHttpRequest Request From=[%s] With Hijack Error:%s",ctx.Request.RemoteAddr,xSrcConnErr.Error()))
+		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 
 
-	xIsKeepAlive:=false
-	if strings.EqualFold(strings.ToLower(xRequest.Header.Get("Proxy-Connection")),"keep-alive"){
-		xIsKeepAlive=true
+	xRespData:=fmt.Sprintf("HTTP/%d.%d %03d %s\n\n",xRequest.ProtoMajor, xRequest.ProtoMinor, http.StatusOK, "Connection established")
+	fmt.Fprint(xSrcConn,xRespData)
+
+	if xProxyDailer.KeepAlive{
+		processConnRelay(xSrcConn,xTargetConn)
 	}
 
-	host := xRequest.Header.Get("Host")
-	if len(host)>0{
-		xRequest.Host=host
+	xTargetConn.Close()
+	xSrcConn.Close()
+}
+
+
+//处理HTTP
+func (this *ProxyApp)processProxyPlainHttpRequest(ctx *gin.Context)  {
+
+	xProxyDailer,xProxyDailerErr:=this.getProxyNextContext(ctx)
+	if xProxyDailerErr!=nil{
+		cheerlib.LogWarn(xProxyDailerErr.Error())
+		cheerlib.StdInfo(xProxyDailerErr.Error())
+		ctx.AbortWithStatus(http.StatusProxyAuthRequired)
+		return
+	}
+
+	cheerlib.StdInfo(fmt.Sprintf("processProxyPlainHttpRequest Request From=[%s] getProxyNextContext KeepAlive=[%v] Target=[%s]",
+		ctx.Request.RemoteAddr,
+		xProxyDailer.KeepAlive,
+		xProxyDailer.TargetHostPort))
+
+	xRequest:=ctx.Request
+
+	xHttpHost := xRequest.Header.Get("Host")
+	if len(xHttpHost)<1{
+		xHttpHost=xRequest.URL.Host
+	}
+	if len(xHttpHost)>0{
+		xRequest.Host=xHttpHost
 	}
 
 	xRequest.RequestURI = ""
-
 	removeHopByHopHeaders(xRequest.Header)
 	removeExtraHTTPHostPort(xRequest)
 
-    if len(xRequest.Host)<1||len(xRequest.URL.Host)<1{
-		ctx.String(http.StatusBadRequest,"invalid request.")
+	if len(xRequest.Host)<1||len(xRequest.URL.Host)<1{
+		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 
-	//HTTPS隧道连接
-	if strings.EqualFold(xRequest.Method,http.MethodConnect){
-
-		xConn,_,xRespRWErr:=ctx.Writer.Hijack()
-
-		if xRespRWErr!=nil{
-			ctx.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
-
-		xTargetConn,xTargetConnErr:=xProxyDailer.Dial("tcp",xRequest.Host)
-
-		if xTargetConnErr!=nil{
-			ctx.String(http.StatusBadGateway,"backend node connect faild.")
-			xConn.Close()
-		}
-
-		xRespData:=fmt.Sprintf("HTTP/%d.%d %03d %s\n\n",xRequest.ProtoMajor, xRequest.ProtoMinor, http.StatusOK, "Connection established")
-		fmt.Fprint(xConn,xRespData)
-
-		processConnRelay(xConn,xTargetConn)
-
-		return
-	}
-
-
+	//HTTP连接
 	xTransport:=http.Transport{}
-	xTransport.Dial=xProxyDailer.Dial
+	xTransport.Dial=xProxyDailer.NextDailer.Dial
 
 	xHttpClient:=http.Client{Transport: &xTransport}
 	xResp,xRespErr:=xHttpClient.Do(xRequest)
 	if xRespErr!=nil{
-		ctx.String(http.StatusBadGateway,"backend node is busy now.")
+		ctx.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 
-
-	if xIsKeepAlive {
+	if xProxyDailer.KeepAlive {
 		xResp.Header.Set("Proxy-Connection", "keep-alive")
 		xResp.Header.Set("Connection", "keep-alive")
 		xResp.Header.Set("Keep-Alive", "timeout=4")
 	}
 
-	xResp.Close = !xIsKeepAlive
+	xResp.Close = !xProxyDailer.KeepAlive
 
-	io.Copy(ctx.Writer,xResp.Body)
+	xSrcConn,_,xSrcConnErr:=ctx.Writer.Hijack()
+	if xSrcConnErr!=nil{
+
+		cheerlib.StdInfo(fmt.Sprintf("processProxyPlainHttpRequest Request From=[%s] With Hijack Error:%s",ctx.Request.RemoteAddr,xSrcConnErr.Error()))
+
+		ctx.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	xResp.Write(xSrcConn)
+
+	if !xProxyDailer.KeepAlive{
+		xSrcConn.Close()
+	}
+}
+
+func (this *ProxyApp)onProxyRequest(ctx *gin.Context)  {
+
+	if strings.EqualFold(ctx.Request.Method,http.MethodConnect){
+		this.processProxyConnectHttpRequest(ctx)
+		return
+	}
+
+	this.processProxyPlainHttpRequest(ctx)
 }
 
 func (this *ProxyApp) runService() error {
@@ -180,7 +276,6 @@ func (this *ProxyApp) runService() error {
 
 	return xError
 }
-
 
 
 func (this *ProxyApp)runWebProxyService() error  {
@@ -222,9 +317,6 @@ func processConnRelay(localConn net.Conn,remoteConn net.Conn)  {
 	}()
 
 	xWaitGroup.Wait()
-
-	localConn.Close()
-	remoteConn.Close()
 }
 
 // removeHopByHopHeaders remove hop-by-hop header
@@ -265,4 +357,24 @@ func removeExtraHTTPHostPort(req *http.Request) {
 
 	req.Host = host
 	req.URL.Host = host
+}
+
+func ParseHostPort(rawHost string, defaultPort uint64) (string, error) {
+	port := defaultPort
+	host, rawPort, err := net.SplitHostPort(rawHost)
+	if err != nil {
+		if addrError, ok := err.(*net.AddrError); ok && strings.Contains(addrError.Err, "missing port") {
+			host = rawHost
+		} else {
+			return "", err
+		}
+	} else if len(rawPort) > 0 {
+		intPort, err := strconv.ParseUint(rawPort, 0, 16)
+		if err != nil {
+			return "", err
+		}
+		port = intPort
+	}
+
+	return fmt.Sprintf("%s:%d",host,port), nil
 }
