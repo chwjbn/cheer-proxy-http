@@ -179,12 +179,12 @@ func (this *ProxyApp)processProxyConnectHttpRequest(ctx *gin.Context)  {
 	xRespData:=fmt.Sprintf("HTTP/%d.%d %03d %s\n\n",xRequest.ProtoMajor, xRequest.ProtoMinor, http.StatusOK, "Connection established")
 	fmt.Fprint(xSrcConn,xRespData)
 
-	if xProxyDailer.KeepAlive{
-		processConnRelay(xSrcConn,xTargetConn)
-	}
+	processConnRelay(xSrcConn,xTargetConn)
 
-	xTargetConn.Close()
-	xSrcConn.Close()
+	if !xProxyDailer.KeepAlive{
+		xSrcConn.Close()
+		xTargetConn.Close()
+	}
 }
 
 
